@@ -2233,6 +2233,68 @@ func TestTxnCanAbort(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestAsyncProducerCallback(t *testing.T) {
+	seedBroker := NewMockBroker(t, 1)
+	leader := NewMockBroker(t, 2)
+
+	metadataResponse := new(MetadataResponse)
+	metadataResponse.AddBroker(leader.Addr(), leader.BrokerID())
+	metadataResponse.AddTopicPartition("my_topic", 0, leader.BrokerID(), nil, nil, nil, ErrNoError)
+	seedBroker.Returns(metadataResponse)
+
+	prodSuccess := new(ProduceResponse)
+	prodSuccess.AddTopicPartition("my_topic", 0, ErrNoError)
+	leader.Returns(prodSuccess)
+
+	config := NewTestConfig()
+	config.Producer.Flush.Messages = 10
+	config.Producer.Return.Successes = true
+	producer, err := NewAsyncProducer([]string{seedBroker.Addr()}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var responsesSeen []*ProduceResponse
+	var errsSeen []error
+	producer.AddCallback(func(resp *ProduceResponse, err error) {
+		responsesSeen = append(responsesSeen, resp)
+		errsSeen = append(errsSeen, err)
+	})
+	var secondCallbackCalled bool
+	producer.AddCallback(func(resp *ProduceResponse, err error) {
+		secondCallbackCalled = true
+	})
+
+	for i := 0; i < 10; i++ {
+		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage), Metadata: i}
+	}
+	for i := 0; i < 10; i++ {
+		select {
+		case msg := <-producer.Errors():
+			t.Error(msg.Err)
+			if msg.Msg.flags != 0 {
+				t.Error("Message had flags set")
+			}
+		case msg := <-producer.Successes():
+			if msg.flags != 0 {
+				t.Error("Message had flags set")
+			}
+			if msg.Metadata.(int) != i {
+				t.Error("Message metadata did not match")
+			}
+		case <-time.After(time.Second):
+			t.Errorf("Timeout waiting for msg #%d", i)
+			goto done
+		}
+	}
+done:
+	closeProducer(t, producer)
+	leader.Close()
+	seedBroker.Close()
+	require.Equal(t, responsesSeen[0], prodSuccess)
+	require.Equal(t, errsSeen[0], nil)
+	require.True(t, secondCallbackCalled)
+}
+
 // This example shows how to use the producer while simultaneously
 // reading the Errors channel to know about any failures.
 func ExampleAsyncProducer_select() {

@@ -70,6 +70,12 @@ type AsyncProducer interface {
 
 	// AddMessageToTxn add message offsets to current transaction.
 	AddMessageToTxn(msg *ConsumerMessage, groupId string, metadata *string) error
+
+	// AddCallback adds a function to be called on each broker response after being parsed.
+	// Callbacks are executed in the order added and are otherwise nonblocking.
+	// Callbacks should generally be added before sending a message, as they will
+	// not be applied to existing broker connections.
+	AddCallback(ProduceCallback)
 }
 
 type asyncProducer struct {
@@ -88,6 +94,7 @@ type asyncProducer struct {
 	txLock sync.Mutex
 
 	metricsRegistry metrics.Registry
+	callback        ProduceCallback
 }
 
 // NewAsyncProducer creates a new AsyncProducer using the given broker addresses and configuration.
@@ -331,6 +338,18 @@ func (p *asyncProducer) AbortTxn() error {
 	}
 	DebugLogger.Printf("producer/txnmgr [%s] transaction aborted\n", p.txnmgr.transactionalID)
 	return nil
+}
+
+func (p *asyncProducer) AddCallback(cb ProduceCallback) {
+	prev := p.callback
+	if prev == nil {
+		p.callback = cb
+	} else {
+		p.callback = func(pr *ProduceResponse, err error) {
+			prev(pr, err)
+			cb(pr, err)
+		}
+	}
 }
 
 func (p *asyncProducer) finishTransaction(commit bool) error {
@@ -776,7 +795,12 @@ func (p *asyncProducer) newBrokerProducer(broker *Broker) *brokerProducer {
 		bridge    = make(chan *produceSet)
 		pending   = make(chan *brokerProducerResponse)
 		responses = make(chan *brokerProducerResponse)
+		callback  = p.callback
 	)
+
+	if callback == nil {
+		callback = func(*ProduceResponse, error) {}
+	}
 
 	bp := &brokerProducer{
 		parent:         p,
@@ -809,6 +833,7 @@ func (p *asyncProducer) newBrokerProducer(broker *Broker) *brokerProducer {
 						res: response,
 					}
 					wg.Done()
+					callback(response, err)
 				}
 			}(set)
 
